@@ -21,12 +21,21 @@ import pandas as pd
 
 from . import levels as level_mod
 from . import liquidity as liq_mod
+from . import news as news_mod
 from . import quarterly as qt_mod
 from . import smt as smt_mod
 from . import structure as struct_mod
 from .levels import KeyLevel, LevelKind
+from .news import NewsEvent
 from .sessions import asia_range, current_session
 from .structure import Trend, atr
+
+# Strict-mode thresholds (used by the daily session-open auto-scan).
+# These are intentionally aggressive so only the highest-quality A+ setups pass.
+STRICT_MIN_SCORE: int = 10
+STRICT_MIN_RR1: float = 3.0
+STRICT_LTF_LOOKBACK: int = 5  # bars on M5
+NEWS_BLACKOUT_MINUTES: int = 30
 
 
 class SignalSide(StrEnum):
@@ -84,11 +93,11 @@ class TradeSignal:
 
 
 def _quality_from_score(score: int) -> SignalQuality:
-    if score >= 9:
+    if score >= 10:
         return SignalQuality.A_PLUS
-    if score >= 7:
+    if score >= 8:
         return SignalQuality.A
-    if score >= 5:
+    if score >= 6:
         return SignalQuality.B
     return SignalQuality.C
 
@@ -113,16 +122,40 @@ class SignalContext:
     symbol: str
     timeframes: dict[str, pd.DataFrame]
     peer_dfs: dict[str, pd.DataFrame] = field(default_factory=dict)
+    news_events: list[NewsEvent] = field(default_factory=list)
 
 
-def build_signals(ctx: SignalContext) -> list[TradeSignal]:
-    """Run the full pipeline and return zero or more trade setups for `ctx.symbol`."""
+def build_signals(ctx: SignalContext, *, strict: bool = False) -> list[TradeSignal]:
+    """Run the full pipeline and return zero or more trade setups for `ctx.symbol`.
+
+    When ``strict=True`` (used by the session-open auto-scan):
+        * only A+ setups with score >= STRICT_MIN_SCORE are returned
+        * RR1 must be >= STRICT_MIN_RR1
+        * the M5 timeframe must show a BOS or sweep in the matching direction
+          within the last STRICT_LTF_LOOKBACK bars
+        * Daily Quarterly Theory must be in Q2 (manipulation) or Q3 (distribution)
+          aligned with the trade side
+        * inducement (LIT) must be confirmed
+        * no high-impact news for the symbol's currencies inside +/-30 minutes
+    """
     out: list[TradeSignal] = []
     h4 = ctx.timeframes.get("H4")
     h1 = ctx.timeframes.get("H1")
     m15 = ctx.timeframes.get("M15")
+    m5 = ctx.timeframes.get("M5")
     if h4 is None or h1 is None or m15 is None or h4.empty or h1.empty or m15.empty:
         return out
+    if strict and (m5 is None or m5.empty):
+        return out
+
+    # News blackout (strict mode only, applied per signal once we have a side).
+    news_clear, news_block = (True, None)
+    if strict:
+        news_clear, news_block = news_mod.is_news_clear(
+            ctx.news_events, ctx.symbol, window_minutes=NEWS_BLACKOUT_MINUTES
+        )
+        if not news_clear:
+            return out  # Whole symbol is blacked out.
 
     # ---- HTF context
     h4_struct = struct_mod.analyze_structure(h4)
@@ -145,6 +178,9 @@ def build_signals(ctx: SignalContext) -> list[TradeSignal]:
     qts = qt_mod.current_quarters()
     daily_q = next(q for q in qts if q.cycle == "Daily")
     qt_bias = qt_mod.directional_bias(daily_q.q)
+    # Strict mode: only Q2 (manipulation) and Q3 (distribution) produce signals.
+    if strict and daily_q.q not in ("Q2", "Q3"):
+        return out
 
     # ---- Liquidity sweeps + SMT
     h1_sweeps = liq_mod.detect_sweeps(h1, h1_struct.swings)
@@ -215,7 +251,8 @@ def build_signals(ctx: SignalContext) -> list[TradeSignal]:
         rr1 = abs(tp1 - entry) / risk
         rr2 = abs(tp2 - entry) / risk
         rr3 = abs(tp3 - entry) / risk
-        if rr1 < 1.5:
+        min_rr = STRICT_MIN_RR1 if strict else 1.5
+        if rr1 < min_rr:
             continue  # Alchemist: minimum RR rule
 
         # ---- Score
@@ -268,12 +305,59 @@ def build_signals(ctx: SignalContext) -> list[TradeSignal]:
             confluences.append(f"SMT divergence: {smt_aligned[0].description}")
 
         # M15 confirmation: BOS/CHOCH agreeing with side
+        wants = "BULLISH" if side is SignalSide.BUY else "BEARISH"
         if m15_struct.events:
             last_event = m15_struct.events[-1]
-            wants = "BULLISH" if side is SignalSide.BUY else "BEARISH"
             if last_event.direction == wants:
                 score += 1
                 confluences.append(f"M15 {last_event.kind} {last_event.direction} confirmation")
+
+        # ---- LTF (M5) confirmation: BOS or sweep in the last N bars matching side.
+        m5_confirmed = False
+        if m5 is not None and not m5.empty:
+            m5_struct = struct_mod.analyze_structure(m5)
+            recent_events = m5_struct.events[-STRICT_LTF_LOOKBACK:]
+            for ev in recent_events:
+                if ev.direction == wants:
+                    m5_confirmed = True
+                    break
+            m5_sweeps = liq_mod.detect_sweeps(m5, m5_struct.swings)
+            sweep_dir = "SELLSIDE" if side is SignalSide.BUY else "BUYSIDE"
+            if any(s.direction == sweep_dir for s in m5_sweeps[-STRICT_LTF_LOOKBACK:]):
+                m5_confirmed = True
+            if m5_confirmed:
+                score += 1
+                confluences.append(
+                    f"M5 LTF confirmation ({wants.lower()} BOS or sweep in last {STRICT_LTF_LOOKBACK} bars)"
+                )
+
+        # ---- QT alignment: only count when Q2/Q3 matches the trade side.
+        qt_aligned = False
+        if daily_q.q == "Q2":
+            # Q2 = manipulation: a sweep against trend that traps shorts/longs.
+            qt_aligned = (
+                (side is SignalSide.BUY and "BULLISH" in qt_bias.upper())
+                or (side is SignalSide.SELL and "BEARISH" in qt_bias.upper())
+                or qt_bias.upper() == "NEUTRAL"
+            )
+        elif daily_q.q == "Q3":
+            qt_aligned = (
+                (side is SignalSide.BUY and "BULLISH" in qt_bias.upper())
+                or (side is SignalSide.SELL and "BEARISH" in qt_bias.upper())
+            )
+        if qt_aligned:
+            score += 1
+            confluences.append(f"Quarterly Theory aligned ({daily_q.code} {qt_bias})")
+
+        # ---- Strict-mode hard gates: must have IDM, M5 confirm, QT alignment.
+        if strict:
+            if not idm_ok or not m5_confirmed or not qt_aligned:
+                continue
+            if score < STRICT_MIN_SCORE:
+                continue
+            # Re-check news for this side (nothing currency-specific yet, but cheap).
+            if not news_clear:
+                continue
 
         signal = TradeSignal(
             symbol=ctx.symbol,

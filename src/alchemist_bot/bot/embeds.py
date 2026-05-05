@@ -116,7 +116,10 @@ def help_embed() -> discord.Embed:
         description=(
             "A Discord bot that fuses **MSNR Key Levels**, **SMC + LIT**, "
             "**ICT Kill Zones**, **Daye Quarterly Theory**, and **SMT divergence** "
-            "to surface A-grade Forex / Gold setups."
+            "to surface A-grade Forex / Gold setups.\n\n"
+            "🔔 **Auto-scan** runs at every session open (Asia 23:00, London 07:00, "
+            "NY 12:00 UTC) in **strict mode**: only A+ score ≥ 10/12, RR ≥ 3, "
+            "M5 confirmed, Q2/Q3 aligned, news-clear setups are posted."
         ),
         color=COLOR_INFO,
     )
@@ -159,6 +162,14 @@ def about_embed() -> discord.Embed:
         title="🪙 Forex Alchemist — Strategy Stack",
         color=COLOR_INFO,
         description=(
+            "**Strict A+ filter** is active on the auto-scan. Each session-open\n"
+            "signal must satisfy *all* of the following — anything weaker is dropped:\n"
+            "• Confluence score **≥ 10/12** (A+ grade)\n"
+            "• Risk:Reward at TP1 **≥ 3.0**\n"
+            "• M5 BOS or sweep within last 5 bars\n"
+            "• Daily Quarterly = **Q2** (manipulation) or **Q3** (distribution), aligned\n"
+            "• No high-impact news within ±30 minutes\n"
+            "• Inducement (LIT) confirmed before the POI\n\n"
             "Every signal is a confluence of:\n"
             "• **MSNR Key Levels** — Support / Resistance / SBR / RBS / QML / OCL\n"
             "• **SMC + LIT** — BOS, CHOCH, Inducement (every POI must have IDM)\n"

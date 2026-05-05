@@ -15,15 +15,23 @@ from ..config import Settings
 from ..data.twelvedata import TwelveDataClient
 from ..pipeline import analyse
 from ..strategy.levels import find_key_levels
+from ..strategy.news import fetch_high_impact_events
 from ..strategy.sessions import asia_range, current_session
+from ..strategy.signal import SignalContext, TradeSignal
 from ..strategy.structure import analyze_structure
 from . import embeds
 
 logger = logging.getLogger(__name__)
 
 
-# Daily auto-scan times (UTC). Aligned with London + NY AM kill zones.
-DAILY_TIMES = [time(7, 30, tzinfo=UTC), time(12, 30, tzinfo=UTC)]
+# Session-open auto-scan times (UTC). Each fires at the opening minute of a major
+# trading session: Asia (Tokyo) at 23:00, London at 07:00, New York at 12:00.
+# Strict mode is used so only A+ score>=10, RR>=3, M5-confirmed setups are posted.
+SESSION_OPEN_TIMES = [
+    time(23, 0, tzinfo=UTC),  # Asia open  (Tokyo)
+    time(7, 0, tzinfo=UTC),   # London open
+    time(12, 0, tzinfo=UTC),  # New York open
+]
 
 
 class AlchemistBot(commands.Bot):
@@ -37,8 +45,8 @@ class AlchemistBot(commands.Bot):
     async def setup_hook(self) -> None:
         self._client = await TwelveDataClient(self.settings.twelvedata_api_key).__aenter__()
         await self.tree.sync()
-        self.daily_scan.start()
-        logger.info("Slash commands synced & daily scheduler started.")
+        self.session_scan.start()
+        logger.info("Slash commands synced & session-open scheduler started (Asia 23:00, London 07:00, NY 12:00 UTC).")
 
     async def close(self) -> None:
         if self._client is not None:
@@ -50,34 +58,49 @@ class AlchemistBot(commands.Bot):
         assert self._client is not None
         return self._client
 
-    @tasks.loop(time=DAILY_TIMES)
-    async def daily_scan(self) -> None:
+    @tasks.loop(time=SESSION_OPEN_TIMES)
+    async def session_scan(self) -> None:
+        """Strict session-open scan: only A+ (score>=10), RR>=3, M5-confirmed,
+        Q2/Q3-aligned, news-clear setups are published."""
         if not self.settings.signal_channel_ids:
-            logger.info("daily_scan: no SIGNAL_CHANNEL_IDS configured, skipping.")
+            logger.info("session_scan: no SIGNAL_CHANNEL_IDS configured, skipping.")
             return
-        logger.info("daily_scan: scanning %s", self.settings.watchlist)
-        all_signals = []
+        sess = current_session()
+        sess_name = sess.name if sess else "Session"
+        logger.info("session_scan (%s) — strict scanning %s", sess_name, self.settings.watchlist)
+
+        # Fetch the news calendar once for the whole batch.
+        news_events = await fetch_high_impact_events()
+
+        all_signals: list[tuple[SignalContext, TradeSignal]] = []
         for symbol in self.settings.watchlist:
             try:
-                ctx, signals = await analyse(self.td, symbol)
-                for sig in signals[:1]:  # best signal per symbol
-                    all_signals.append((ctx, sig))
+                ctx, signals = await analyse(
+                    self.td, symbol, strict=True, news_events=news_events
+                )
+                if signals:
+                    all_signals.append((ctx, signals[0]))  # best per symbol
             except Exception:  # noqa: BLE001
-                logger.exception("daily_scan failed for %s", symbol)
-        # Filter A / A+ only
-        a_grade = [(c, s) for c, s in all_signals if s.score >= 7]
-        if not a_grade:
+                logger.exception("session_scan failed for %s", symbol)
+
+        if not all_signals:
+            logger.info("session_scan: no A+ setups passed strict filters this session.")
             return
+        all_signals.sort(key=lambda r: r[1].score, reverse=True)
+
         for channel_id in self.settings.signal_channel_ids:
             channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
             if channel is None or not isinstance(channel, discord.abc.Messageable):
                 continue
-            await channel.send(content="**Daily A-Grade Setups**", embed=embeds.market_state_embed())
-            for ctx, sig in a_grade:
+            await channel.send(
+                content=f"**{sess_name} Open — A+ Strict Setups**",
+                embed=embeds.market_state_embed(),
+            )
+            for ctx, sig in all_signals:
                 file = await _make_chart_file(ctx, sig)
                 await channel.send(embed=embeds.signal_embed(sig), file=file)
 
-    @daily_scan.before_loop
+    @session_scan.before_loop
     async def _before_scan(self) -> None:
         await self.wait_until_ready()
 
