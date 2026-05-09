@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forex-alchemist-bot"
+version = "0.1.0"
+description = "Discord bot that analyses Forex and Gold markets using MSNR, SMC+LIT, ICT Kill Zones, Quarterly Theory and SMT divergence."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Forex Alchemist" }]
+
+dependencies = [
+    "discord.py>=2.4",
+    "aiohttp>=3.9",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "python-dotenv>=1.0",
+    "matplotlib>=3.9",
+    "mplfinance>=0.12.10b0",
+    "pytz>=2024.1",
+    "tabulate>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+alchemist-bot = "alchemist_bot.bot.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alchemist_bot"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
