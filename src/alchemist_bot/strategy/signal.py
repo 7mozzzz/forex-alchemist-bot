@@ -31,9 +31,10 @@ from .sessions import asia_range, current_session
 from .structure import Trend, atr
 
 # Strict-mode thresholds (used by the daily session-open auto-scan).
-# These are intentionally aggressive so only the highest-quality A+ setups pass.
-STRICT_MIN_SCORE: int = 10
-STRICT_MIN_RR1: float = 3.0
+# Calibrated to produce ~1-3 high-quality setups per session-open day instead
+# of zero. Hard gates: IDM + M5 confirm + news-clear. QT alignment is a bonus.
+STRICT_MIN_SCORE: int = 8
+STRICT_MIN_RR1: float = 2.0
 STRICT_LTF_LOOKBACK: int = 5  # bars on M5
 NEWS_BLACKOUT_MINUTES: int = 30
 
@@ -129,14 +130,13 @@ def build_signals(ctx: SignalContext, *, strict: bool = False) -> list[TradeSign
     """Run the full pipeline and return zero or more trade setups for `ctx.symbol`.
 
     When ``strict=True`` (used by the session-open auto-scan):
-        * only A+ setups with score >= STRICT_MIN_SCORE are returned
+        * only setups with score >= STRICT_MIN_SCORE are returned
         * RR1 must be >= STRICT_MIN_RR1
         * the M5 timeframe must show a BOS or sweep in the matching direction
           within the last STRICT_LTF_LOOKBACK bars
-        * Daily Quarterly Theory must be in Q2 (manipulation) or Q3 (distribution)
-          aligned with the trade side
         * inducement (LIT) must be confirmed
         * no high-impact news for the symbol's currencies inside +/-30 minutes
+        * Quarterly Theory alignment is awarded as a score bonus, not a hard gate.
     """
     out: list[TradeSignal] = []
     h4 = ctx.timeframes.get("H4")
@@ -178,9 +178,6 @@ def build_signals(ctx: SignalContext, *, strict: bool = False) -> list[TradeSign
     qts = qt_mod.current_quarters()
     daily_q = next(q for q in qts if q.cycle == "Daily")
     qt_bias = qt_mod.directional_bias(daily_q.q)
-    # Strict mode: only Q2 (manipulation) and Q3 (distribution) produce signals.
-    if strict and daily_q.q not in ("Q2", "Q3"):
-        return out
 
     # ---- Liquidity sweeps + SMT
     h1_sweeps = liq_mod.detect_sweeps(h1, h1_struct.swings)
@@ -349,13 +346,13 @@ def build_signals(ctx: SignalContext, *, strict: bool = False) -> list[TradeSign
             score += 1
             confluences.append(f"Quarterly Theory aligned ({daily_q.code} {qt_bias})")
 
-        # ---- Strict-mode hard gates: must have IDM, M5 confirm, QT alignment.
+        # ---- Strict-mode hard gates: must have IDM, M5 confirm, score >= threshold.
+        # QT alignment is a bonus (counted in score) but not a hard gate.
         if strict:
-            if not idm_ok or not m5_confirmed or not qt_aligned:
+            if not idm_ok or not m5_confirmed:
                 continue
             if score < STRICT_MIN_SCORE:
                 continue
-            # Re-check news for this side (nothing currency-specific yet, but cheap).
             if not news_clear:
                 continue
 
